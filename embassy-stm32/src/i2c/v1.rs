@@ -475,6 +475,31 @@ impl<'d, M: PeriMode, IM: MasterMode> I2c<'d, M, IM> {
     }
 }
 
+/// RAII guard around a single async master-mode DMA frame transfer (`write_frame`/`read_frame`).
+///
+/// Disables DMA/IRQ unconditionally on drop, whether the transfer completed normally or its
+/// future was dropped mid-flight (e.g. by `with_timeout` or `select`). `stop_pending` tracks
+/// whether a STOP is still owed: it starts `true` so an early cancellation (before the caller
+/// has made its own STOP-or-no-STOP decision) defaults to leaving the bus safe, and the call
+/// site clears it once that decision has actually been carried out.
+struct FrameStopGuard {
+    info: &'static Info,
+    stop_pending: bool,
+}
+
+impl Drop for FrameStopGuard {
+    fn drop(&mut self) {
+        self.info.regs.cr2().modify(|w| {
+            w.set_dmaen(false);
+            w.set_iterren(false);
+            w.set_itevten(false);
+        });
+        if self.stop_pending {
+            self.info.regs.cr1().modify(|w| w.set_stop(true));
+        }
+    }
+}
+
 impl<'d, IM: MasterMode> I2c<'d, Async, IM> {
     async fn write_frame(&mut self, address: Address, write_buffer: &[u8], frame: FrameOptions) -> Result<(), Error> {
         let timeout = self.timeout();
@@ -501,15 +526,12 @@ impl<'d, IM: MasterMode> I2c<'d, Async, IM> {
             w.set_last(false);
         });
 
-        // Sentinel to disable transfer when an error occurs or future is canceled.
-        // TODO: Generate STOP condition on cancel?
-        let on_drop = OnDrop::new(|| {
-            self.info.regs.cr2().modify(|w| {
-                w.set_dmaen(false);
-                w.set_iterren(false);
-                w.set_itevten(false);
-            })
-        });
+        // Sentinel to disable transfer and issue STOP if an error occurs or the future is
+        // canceled before this call has made its own STOP-or-no-STOP decision.
+        let mut guard = FrameStopGuard {
+            info: self.info,
+            stop_pending: true,
+        };
 
         if frame.send_start() {
             // Send a START condition
@@ -614,7 +636,10 @@ impl<'d, IM: MasterMode> I2c<'d, Async, IM> {
                 if frame.send_stop() {
                     self.info.regs.cr1().modify(|w| w.set_stop(true));
                 }
-                drop(on_drop);
+                // Whether STOP was just sent or deliberately withheld (a repeated START is
+                // coming), this call's own STOP decision is complete: a drop from here on must
+                // not also send one.
+                guard.stop_pending = false;
                 return Ok(());
             }
         }
@@ -685,8 +710,9 @@ impl<'d, IM: MasterMode> I2c<'d, Async, IM> {
                 w.set_stop(true);
             });
         }
-
-        drop(on_drop);
+        // Whether STOP was just sent or deliberately withheld, this call's own STOP decision is
+        // complete: a drop from here on must not also send one.
+        guard.stop_pending = false;
 
         // Fallthrough is success
         Ok(())
@@ -732,15 +758,12 @@ impl<'d, IM: MasterMode> I2c<'d, Async, IM> {
             w.set_last(frame.send_nack() && !single_byte);
         });
 
-        // Sentinel to disable transfer when an error occurs or future is canceled.
-        // TODO: Generate STOP condition on cancel?
-        let on_drop = OnDrop::new(|| {
-            self.info.regs.cr2().modify(|w| {
-                w.set_dmaen(false);
-                w.set_iterren(false);
-                w.set_itevten(false);
-            })
-        });
+        // Sentinel to disable transfer and issue STOP if an error occurs or the future is
+        // canceled before this call has made its own STOP-or-no-STOP decision.
+        let mut guard = FrameStopGuard {
+            info: self.info,
+            stop_pending: true,
+        };
 
         if frame.send_start() {
             // Send a START condition and set ACK bit
@@ -952,8 +975,10 @@ impl<'d, IM: MasterMode> I2c<'d, Async, IM> {
                 w.set_stop(true);
             });
         }
-
-        drop(on_drop);
+        // Whether STOP was just sent here, sent earlier (single-byte case, above), or
+        // deliberately withheld, this call's own STOP decision is complete: a drop from here on
+        // must not also send one.
+        guard.stop_pending = false;
 
         // Fallthrough is success
         Ok(())

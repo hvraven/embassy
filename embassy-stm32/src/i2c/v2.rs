@@ -915,6 +915,138 @@ impl<'d, M: Mode, IM: MasterMode> I2c<'d, M, IM> {
     }
 }
 
+/// RAII guard around a single async DMA write transfer.
+///
+/// Disables DMA/IRQ and clears error flags unconditionally on drop, whether the transfer
+/// completed normally or its future was dropped mid-flight (e.g. by `with_timeout` or
+/// `select`). `stop_pending` tracks whether a STOP is still owed: it starts `true` so an early
+/// cancellation (before the caller has made its own STOP-or-no-STOP decision) defaults to
+/// leaving the bus safe, and the call site clears it once that decision has actually been
+/// carried out.
+struct WriteTransferStopGuard {
+    info: &'static Info,
+    last_slice: bool,
+    stop_pending: bool,
+}
+
+impl Drop for WriteTransferStopGuard {
+    fn drop(&mut self) {
+        let regs = self.info.regs;
+        let isr = regs.isr().read();
+        regs.cr1().modify(|w| {
+            if self.last_slice || isr.nackf() || isr.arlo() || isr.berr() || isr.ovr() {
+                w.set_txdmaen(false);
+            }
+            w.set_tcie(false);
+            w.set_nackie(false);
+            w.set_errie(false);
+        });
+        regs.icr().write(|w| {
+            w.set_nackcf(true);
+            w.set_berrcf(true);
+            w.set_arlocf(true);
+            w.set_ovrcf(true);
+        });
+        // The PE toggle below fully resets the peripheral state machine (see `soft_reset`),
+        // which leaves nothing in flight and no BUSY/START condition for a STOP to terminate.
+        // A STOP write survives such a reset (only a detected STOP condition or PE=0 clears it),
+        // so it must not be issued alongside the toggle or it would leak into the next transfer.
+        let did_soft_reset = isr.berr() || isr.arlo();
+        if did_soft_reset {
+            regs.cr1().modify(|w| w.set_pe(false));
+            while regs.cr1().read().pe() {}
+            regs.cr1().modify(|w| w.set_pe(true));
+        }
+        if self.stop_pending && !did_soft_reset {
+            regs.cr2().write(|w| w.set_stop(true));
+        }
+    }
+}
+
+/// RAII guard around a single async DMA read transfer.
+///
+/// See [`WriteTransferStopGuard`] for the shape of this pattern; the only difference is which
+/// DMA-enable bit the safe-subset cleanup clears (`rxdmaen` unconditionally here, since these
+/// read helpers never span more than one DMA transfer per call).
+struct ReadTransferStopGuard {
+    info: &'static Info,
+    stop_pending: bool,
+}
+
+impl Drop for ReadTransferStopGuard {
+    fn drop(&mut self) {
+        let regs = self.info.regs;
+        let isr = regs.isr().read();
+        regs.cr1().modify(|w| {
+            w.set_rxdmaen(false);
+            w.set_tcie(false);
+            w.set_nackie(false);
+            w.set_errie(false);
+        });
+        regs.icr().write(|w| {
+            w.set_nackcf(true);
+            w.set_berrcf(true);
+            w.set_arlocf(true);
+            w.set_ovrcf(true);
+        });
+        // The PE toggle below fully resets the peripheral state machine (see `soft_reset`),
+        // which leaves nothing in flight and no BUSY/START condition for a STOP to terminate.
+        // A STOP write survives such a reset (only a detected STOP condition or PE=0 clears it),
+        // so it must not be issued alongside the toggle or it would leak into the next transfer.
+        let did_soft_reset = isr.berr() || isr.arlo();
+        if did_soft_reset {
+            regs.cr1().modify(|w| w.set_pe(false));
+            while regs.cr1().read().pe() {}
+            regs.cr1().modify(|w| w.set_pe(true));
+        }
+        if self.stop_pending && !did_soft_reset {
+            regs.cr2().write(|w| w.set_stop(true));
+        }
+    }
+}
+
+/// Tri-state STOP bookkeeping for a call that issues more than one master-mode DMA transfer in
+/// sequence (e.g. `write_read`, or `transaction` looping over operation groups).
+///
+/// Each individual inner DMA transfer already gets its own [`WriteTransferStopGuard`] /
+/// [`ReadTransferStopGuard`] covering the time it is actually in flight. This guard instead
+/// covers the gaps *between* those inner calls — after one transfer's START has gone out but
+/// before the sequence's final STOP is confirmed — where no inner guard is alive to react to a
+/// dropped future. It has to be a plain runtime state machine rather than a typestate: it must
+/// stay droppable from anywhere inside a loop spanning many iterations, which rules out
+/// rebinding its type at each transition.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SequenceStopState {
+    /// No START has been issued yet for this call; a drop now needs no cleanup.
+    Idle,
+    /// A START is out and no terminating STOP has been confirmed yet; a drop now must issue one.
+    StopPending,
+    /// The call completed normally; STOP was already confirmed (or was never needed).
+    Done,
+}
+
+struct SequenceStopGuard {
+    info: &'static Info,
+    state: SequenceStopState,
+}
+
+impl SequenceStopGuard {
+    fn new(info: &'static Info) -> Self {
+        Self {
+            info,
+            state: SequenceStopState::Idle,
+        }
+    }
+}
+
+impl Drop for SequenceStopGuard {
+    fn drop(&mut self) {
+        if self.state == SequenceStopState::StopPending {
+            self.info.regs.cr2().write(|w| w.set_stop(true));
+        }
+    }
+}
+
 impl<'d, IM: MasterMode> I2c<'d, Async, IM> {
     async fn write_dma_internal(
         &mut self,
@@ -945,29 +1077,11 @@ impl<'d, IM: MasterMode> I2c<'d, Async, IM> {
 
         let mut remaining_len = total_len;
 
-        let on_drop = OnDrop::new(|| {
-            let regs = self.info.regs;
-            let isr = regs.isr().read();
-            regs.cr1().modify(|w| {
-                if last_slice || isr.nackf() || isr.arlo() || isr.berr() || isr.ovr() {
-                    w.set_txdmaen(false);
-                }
-                w.set_tcie(false);
-                w.set_nackie(false);
-                w.set_errie(false);
-            });
-            regs.icr().write(|w| {
-                w.set_nackcf(true);
-                w.set_berrcf(true);
-                w.set_arlocf(true);
-                w.set_ovrcf(true);
-            });
-            if isr.berr() || isr.arlo() {
-                regs.cr1().modify(|w| w.set_pe(false));
-                while regs.cr1().read().pe() {}
-                regs.cr1().modify(|w| w.set_pe(true));
-            }
-        });
+        let mut guard = WriteTransferStopGuard {
+            info: self.info,
+            last_slice,
+            stop_pending: true,
+        };
 
         poll_fn(|cx| {
             self.state.waker.register(cx.waker());
@@ -1046,8 +1160,10 @@ impl<'d, IM: MasterMode> I2c<'d, Async, IM> {
         if last_slice & send_stop {
             self.master_stop();
         }
-
-        drop(on_drop);
+        // Whether STOP was just sent or deliberately withheld (more buffers/groups still to
+        // come, restart will follow), this call's own STOP decision is complete: a drop from
+        // here on must not also send one.
+        guard.stop_pending = false;
 
         Ok(())
     }
@@ -1076,27 +1192,10 @@ impl<'d, IM: MasterMode> I2c<'d, Async, IM> {
 
         let mut remaining_len = total_len;
 
-        let on_drop = OnDrop::new(|| {
-            let regs = self.info.regs;
-            let isr = regs.isr().read();
-            regs.cr1().modify(|w| {
-                w.set_rxdmaen(false);
-                w.set_tcie(false);
-                w.set_nackie(false);
-                w.set_errie(false);
-            });
-            regs.icr().write(|w| {
-                w.set_nackcf(true);
-                w.set_berrcf(true);
-                w.set_arlocf(true);
-                w.set_ovrcf(true);
-            });
-            if isr.berr() || isr.arlo() {
-                regs.cr1().modify(|w| w.set_pe(false));
-                while regs.cr1().read().pe() {}
-                regs.cr1().modify(|w| w.set_pe(true));
-            }
-        });
+        let mut guard = ReadTransferStopGuard {
+            info: self.info,
+            stop_pending: true,
+        };
 
         poll_fn(|cx| {
             self.state.waker.register(cx.waker());
@@ -1161,7 +1260,10 @@ impl<'d, IM: MasterMode> I2c<'d, Async, IM> {
             }
         }
 
-        drop(on_drop);
+        // This call always uses Stop::Automatic, so by the time the transfer above has
+        // completed, the peripheral has already generated (or is generating) STOP on its own:
+        // a drop from here on must not also send one.
+        guard.stop_pending = false;
 
         Ok(())
     }
@@ -1193,6 +1295,11 @@ impl<'d, IM: MasterMode> I2c<'d, Async, IM> {
             return self.write_internal(address, &[], true, timeout);
         }
 
+        // Only the last buffer's write_dma_internal call sends STOP; this guard covers the gaps
+        // between buffers below (each its own .await), which no inner guard reaches.
+        let mut guard = SequenceStopGuard::new(self.info);
+        guard.state = SequenceStopState::StopPending;
+
         let mut iter = write.iter();
         let mut first = true;
         let mut current = iter.next();
@@ -1213,6 +1320,8 @@ impl<'d, IM: MasterMode> I2c<'d, Async, IM> {
             first = false;
             current = next;
         }
+
+        guard.state = SequenceStopState::Done;
         Ok(())
     }
 
@@ -1241,6 +1350,12 @@ impl<'d, IM: MasterMode> I2c<'d, Async, IM> {
         let address = address.into();
         let timeout = self.timeout();
 
+        // Spans both steps below: once the write's START has gone out, the bus stays
+        // mid-transaction (no STOP) until the read step's STOP is confirmed, and that gap
+        // crosses the .await boundary between the two steps that no inner guard covers.
+        let mut guard = SequenceStopGuard::new(self.info);
+        guard.state = SequenceStopState::StopPending;
+
         if write.is_empty() {
             self.write_internal(address, write, false, timeout)?;
         } else {
@@ -1255,6 +1370,7 @@ impl<'d, IM: MasterMode> I2c<'d, Async, IM> {
             timeout.with(fut).await?;
         }
 
+        guard.state = SequenceStopState::Done;
         Ok(())
     }
 
@@ -1273,6 +1389,13 @@ impl<'d, IM: MasterMode> I2c<'d, Async, IM> {
         let address = addr.into();
         let timeout = self.timeout();
 
+        // Spans every group in the loop below: `execute_*_group_async` deliberately leaves the
+        // bus without a STOP between groups (a repeated START follows), and that gap — as well
+        // as the gap between buffers inside a single group — crosses .await boundaries that no
+        // inner guard covers. Stays Idle (no STOP on drop) if `operations` turns out empty and
+        // the loop body below never runs.
+        let mut guard = SequenceStopGuard::new(self.info);
+
         // Group consecutive operations of the same type
         let mut op_idx = 0;
         let mut is_first_group = true;
@@ -1288,6 +1411,9 @@ impl<'d, IM: MasterMode> I2c<'d, Async, IM> {
             }
             let group_end = op_idx;
             let is_last_group = op_idx >= operations.len();
+
+            // Arm before the first group's inner call; a no-op write on later iterations.
+            guard.state = SequenceStopState::StopPending;
 
             // Execute this group of operations
             if is_read {
@@ -1313,6 +1439,7 @@ impl<'d, IM: MasterMode> I2c<'d, Async, IM> {
             is_first_group = false;
         }
 
+        guard.state = SequenceStopState::Done;
         Ok(())
     }
 
@@ -1486,27 +1613,10 @@ impl<'d, IM: MasterMode> I2c<'d, Async, IM> {
 
         let mut remaining_len = total_len;
 
-        let on_drop = OnDrop::new(|| {
-            let regs = self.info.regs;
-            let isr = regs.isr().read();
-            regs.cr1().modify(|w| {
-                w.set_rxdmaen(false);
-                w.set_tcie(false);
-                w.set_nackie(false);
-                w.set_errie(false);
-            });
-            regs.icr().write(|w| {
-                w.set_nackcf(true);
-                w.set_berrcf(true);
-                w.set_arlocf(true);
-                w.set_ovrcf(true);
-            });
-            if isr.berr() || isr.arlo() {
-                regs.cr1().modify(|w| w.set_pe(false));
-                while regs.cr1().read().pe() {}
-                regs.cr1().modify(|w| w.set_pe(true));
-            }
-        });
+        let mut guard = ReadTransferStopGuard {
+            info: self.info,
+            stop_pending: true,
+        };
 
         poll_fn(|cx| {
             self.state.waker.register(cx.waker());
@@ -1563,7 +1673,12 @@ impl<'d, IM: MasterMode> I2c<'d, Async, IM> {
         .await?;
 
         dma_transfer.await;
-        drop(on_drop);
+
+        // `stop_mode` was decided by the caller: Automatic means the peripheral has already
+        // generated STOP on its own by now; Software means this call deliberately leaves the
+        // bus open for a subsequent buffer/group (the enclosing `SequenceStopGuard` in
+        // `transaction` covers that gap). Either way this call's own STOP decision is complete.
+        guard.stop_pending = false;
 
         Ok(())
     }
